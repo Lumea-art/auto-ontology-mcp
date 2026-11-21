@@ -541,6 +541,26 @@ def test_a_question_word_does_not_dilute_a_search_score(modeled):
     assert question["Region"] > 0.5
 
 
+def test_a_field_named_like_a_question_word_is_still_searchable():
+    """`make` is a car's column name as often as it is a verb: field text keeps it.
+
+    The question's grammar is dropped from the query only. Tokenizing the indexed
+    field text with that list too would score every `Make` or `Place` column zero.
+    """
+    from auto_ontology_mcp.naming import QUESTION_WORDS, STOPWORDS, tokens
+    from auto_ontology_mcp.search import Doc, score
+
+    make = Doc("attribute", "a1", "Vehicle > Make", [("Make", 1.0)])
+    place = Doc("attribute", "a2", "Event > Place", [("Place", 1.0)])
+
+    assert score("make", make) == pytest.approx(1.0)
+    assert score("vehicle make", make) == pytest.approx(0.5)
+    assert score("place", place) == pytest.approx(1.0)
+    assert tokens("Make") == ["make"]
+    assert "make" not in STOPWORDS and "make" not in QUESTION_WORDS
+    assert "place" not in QUESTION_WORDS
+
+
 def test_domain_names_survive_the_stopword_list():
     """A column or table name that doubles as a common word stays searchable."""
     from auto_ontology_mcp.naming import STOPWORDS, tokens

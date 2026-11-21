@@ -21,10 +21,16 @@ STOPWORDS = frozenset(
     please can could would should will there than then into over under between during
     last next previous current first top bottom most least total number count sum avg
     average min max minimum maximum
+    """.split()
+)
+
+
+# Words a question is built from rather than a name it asks about: auxiliaries and
+# negation. Dropped from a question's own tokens only -- never from indexed field
+# text, where "Make", "Place" and "Order No" are ordinary column names.
+QUESTION_WORDS = frozenset(
+    """
     has have had having no not
-    place placed sold shows shown listed includes include included contains contain
-    containing uses use used using gives given makes made make wants want needs need
-    gets got provides provide provided
     """.split()
 )
 
