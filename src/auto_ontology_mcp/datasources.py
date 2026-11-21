@@ -320,11 +320,20 @@ class Connections:
 
 
 def _arm_timeout(con: sa.Connection, dialect: str, timeout_s: int) -> threading.Timer | None:
-    """SQLite has no statement timeout; interrupt it from a timer instead."""
-    if dialect != "sqlite":
+    """SQLite and DuckDB have no statement timeout; interrupt them from a timer instead.
+
+    The other dialects get one from the server: PostgreSQL sees ``statement_timeout``
+    in the connection options, MySQL a session ``MAX_EXECUTION_TIME``, Oracle the
+    driver's per-round-trip ``call_timeout``. DuckDB has neither a setting nor a
+    server to carry one, so without this the per-query timeout never fires there.
+    """
+    if dialect not in ("sqlite", "duckdb"):
         return None
     raw = con.connection.dbapi_connection
-    timer = threading.Timer(timeout_s, lambda: raw.interrupt())  # type: ignore[union-attr]
+    interrupt = getattr(raw, "interrupt", None)
+    if not callable(interrupt):
+        return None
+    timer = threading.Timer(timeout_s, interrupt)
     timer.daemon = True
     timer.start()
     return timer
