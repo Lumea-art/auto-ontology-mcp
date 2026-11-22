@@ -513,3 +513,76 @@ def test_mixed_case_names_are_quoted_for_folding_dialects():
     # A correctly quoted query resolves, and its columns are traced to the catalog.
     quoted_ok = validator.validate('SELECT "OrderDate" FROM "Orders" WHERE total / 2 > 1', probe=False)
     assert quoted_ok["valid"] and any("Integer division" in w for w in quoted_ok["warnings"])
+
+
+def test_question_grammar_is_not_an_entity(modeled):
+    """"has", "have" and "no" ask about the data; they are not entities to cover.
+
+    "has" used to arrive as an entity of its own, land in not_covered and turn an
+    otherwise answerable question into partially_answerable with the advice
+    "No Term covers: has".
+    """
+    has = modeled.check_answerable("Which region has the most employees?")
+    assert [e["entity"] for e in has["entities"]] == ["region", "employee"]
+    assert has["verdict"] == "answerable"
+
+    have = modeled.check_answerable("Which employees have no manager?")
+    assert [e["entity"] for e in have["entities"]] == ["employee", "manager"]
+    assert have["verdict"] == "answerable"
+
+
+def test_a_question_word_barely_dilutes_a_search_score(modeled):
+    """An unmatched auxiliary costs a little, not the third it cost before.
+
+    It cannot be free: the field may carry it as part of its name, and then it has
+    to count. So the question stays just under its own content words.
+    """
+    question = {h["name"]: h["score"] for h in modeled.search_ontology("Which region has the most employees?")["hits"]}
+    words = {h["name"]: h["score"] for h in modeled.search_ontology("region employee")["hits"]}
+
+    assert question["Region"] < words["Region"]
+    assert question["Region"] > 0.95 * words["Region"]
+    assert question["Region"] > 0.5
+
+
+def test_a_field_named_like_a_question_word_is_still_searchable():
+    """`make` is a car's column name as often as it is a verb: field text keeps it.
+
+    The question's grammar is dropped from the query only. Tokenizing the indexed
+    field text with that list too would score every `Make` or `Place` column zero.
+    """
+    from auto_ontology_mcp.naming import QUESTION_WORDS, STOPWORDS, tokens
+    from auto_ontology_mcp.search import Doc, score
+
+    make = Doc("attribute", "a1", "Vehicle > Make", [("Make", 1.0)])
+    place = Doc("attribute", "a2", "Event > Place", [("Place", 1.0)])
+    order_no = Doc("attribute", "a3", "Order No", [("Order No", 1.0)])
+    order = Doc("attribute", "a4", "Order", [("Order", 1.0)])
+    has_children = Doc("attribute", "a5", "Has Children", [("Has Children", 1.0)])
+    children = Doc("attribute", "a6", "Children", [("Children", 1.0)])
+
+    assert score("make", make) == pytest.approx(1.0)
+    assert score("vehicle make", make) == pytest.approx(0.5)
+    assert score("place", place) == pytest.approx(1.0)
+
+    # A question word the field carries is part of the name being asked for, so
+    # "order no" must rank "Order No" above "Order" rather than rewarding the
+    # shorter field for dropping it.
+    assert score("order no", order_no) == pytest.approx(1.0)
+    assert score("order no", order) == pytest.approx(0.9615)
+    assert score("order no", order_no) > score("order no", order)
+    assert score("has children", has_children) == pytest.approx(1.0)
+    assert score("has children", children) == pytest.approx(0.9615)
+    assert score("has children", has_children) > score("has children", children)
+
+    assert tokens("Make") == ["make"]
+    assert "make" not in STOPWORDS and "make" not in QUESTION_WORDS
+    assert "place" not in QUESTION_WORDS
+
+
+def test_domain_names_survive_the_stopword_list():
+    """A column or table name that doubles as a common word stays searchable."""
+    from auto_ontology_mcp.naming import STOPWORDS, tokens
+
+    assert tokens("orders by status") == ["order", "status"]
+    assert {"order", "status", "customer", "product", "employee"} & STOPWORDS == set()
