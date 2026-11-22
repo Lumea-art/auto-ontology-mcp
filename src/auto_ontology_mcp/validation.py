@@ -177,6 +177,7 @@ class Validator:
         self._check_branch_fanout(analysis, fanned, warnings)
         self._check_list_columns(analysis, warnings)
         if analysis.qualified:
+            warnings += structure.cartesian_products(analysis.tree)
             warnings += structure.integer_divisions(analysis.tree, self.dialect, self._col)
             warnings += structure.vacuous_group_by(analysis.tree, self.dialect, self._col)
             warnings += structure.missing_aggregation(

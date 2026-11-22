@@ -16,7 +16,7 @@ from typing import Any, Callable
 from sqlglot import exp
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from .sqlcheck import PhysicalColumn, _coarse_type, _trace
+from .sqlcheck import PhysicalColumn, _coarse_type, _column_side, _trace
 
 # Dialects where integer / integer drops the fraction. MySQL, DuckDB, Snowflake, BigQuery,
 # ClickHouse and Oracle return a fractional result.
@@ -244,6 +244,146 @@ def missing_aggregation(
                         f"(or the database rejects the query). Aggregate it (MIN, MAX, COUNT, a list) or add it "
                         f"to GROUP BY."
                     )
+    return out
+
+
+# ------------------------------------------------------------ cartesian product
+class _Groups:
+    """Union-find over the physical tables that predicates tie together."""
+
+    def __init__(self, keys: list[tuple[str, str]]) -> None:
+        self._parent = {key: key for key in keys}
+
+    def find(self, key: tuple[str, str]) -> tuple[str, str]:
+        while self._parent[key] != key:
+            self._parent[key] = self._parent[self._parent[key]]
+            key = self._parent[key]
+        return key
+
+    def union(self, first: tuple[str, str], second: tuple[str, str]) -> None:
+        left, right = self.find(first), self.find(second)
+        if left != right:
+            self._parent[right] = left
+
+    def groups(self) -> list[list[tuple[str, str]]]:
+        out: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for key in self._parent:
+            out.setdefault(self.find(key), []).append(key)
+        return list(out.values())
+
+
+def _physical_tables(scope: Scope) -> dict[tuple[str, str], str]:
+    """Physical tables the scope reads itself, keyed by (schema, name), with the name to print."""
+    tables: dict[tuple[str, str], str] = {}
+    for source in scope.sources.values():
+        if isinstance(source, exp.Table):
+            key = ((source.db or "").casefold(), source.name.casefold())
+            tables[key] = f"{source.db}.{source.name}" if source.db else source.name
+    return tables
+
+
+def _table_key(table: exp.Table) -> tuple[str, str]:
+    return ((table.db or "").casefold(), table.name.casefold())
+
+
+def cartesian_products(tree: exp.Expression) -> list[str]:
+    """Tables read side by side that no predicate ties together.
+
+    A CROSS JOIN, a JOIN with no ON and a comma in FROM pair every row of one table with every
+    row of the other. The join checks and the containment probe do not see it when the two value
+    ranges overlap, so the query answers with a multiplied count or an inflated sum.
+    """
+    out: list[str] = []
+    for scope in _scopes(tree):
+        select = scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        tables = _physical_tables(scope)
+        if len(tables) < 2:
+            continue
+        groups = _Groups(list(tables))
+
+        def linked(first: exp.Expression | None, second: exp.Expression | None) -> None:
+            """Union the two tables when both sides of a predicate are columns this scope reads."""
+            left = _column_side(first) if first is not None else None
+            right = _column_side(second) if second is not None else None
+            if left is None or right is None:
+                return
+            one, two = _trace(scope, left), _trace(scope, right)
+            if one is None or two is None or one.table_key not in tables or two.table_key not in tables:
+                return
+            groups.union(one.table_key, two.table_key)
+
+        # Any comparison links two tables: a range join (between, >, <) ties the rows as much as
+        # an equality does. WHERE counts as much as ON: "FROM a, b WHERE a.id = b.a_id" is the old
+        # way to write a join.
+        for comparison in select.find_all((exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            if comparison.find_ancestor(exp.Select) is not select:
+                continue  # inside a subquery of this scope, which gets its own check
+            linked(comparison.left, comparison.right)
+        for between in select.find_all(exp.Between):
+            if between.find_ancestor(exp.Select) is not select:
+                continue
+            for bound in (between.args.get("low"), between.args.get("high")):
+                linked(between.this, bound)
+        joins = [j for j in select.args.get("joins") or [] if isinstance(j.this, exp.Table)]
+        for join in joins:
+            key = _table_key(join.this)
+            if key not in tables:
+                continue
+            # USING and NATURAL tie the joined table to the tables on its left. The columns of an
+            # ON predicate were traced above. Either way the table is not left on its own.
+            if join.args.get("using") or str(join.args.get("method") or "").upper() == "NATURAL":
+                for other in tables:
+                    if other != key:
+                        groups.union(key, other)
+        components = groups.groups()
+        if len(components) == 1:
+            continue
+        lonely = [tables[key] for component in components if len(component) == 1 for key in component]
+        if lonely and len(lonely) == len(tables):
+            message = (
+                f"Tables {', '.join(lonely)} are read in the same FROM/JOIN list with no predicate linking them, so "
+                f"every row of one pairs with every row of the other (cartesian product): counts come back "
+                f"multiplied and sums inflated. Add a condition that ties the tables together, for example "
+                f"{lonely[0]}.id = {lonely[1]}.{lonely[0]}_id."
+            )
+        elif lonely:
+            if len(lonely) == 1:
+                subject = f"Table {lonely[0]} appears in the FROM/JOIN list"
+                pronoun, those = "it", "that table"
+            else:
+                subject = f"Tables {', '.join(lonely)} appear in the FROM/JOIN list"
+                pronoun, those = "them", "those tables"
+            message = (
+                f"{subject} but no predicate links {pronoun} to the rest, so every row of {those} pairs with every "
+                f"row of the others (cartesian product): counts come back multiplied and sums inflated. Add a "
+                f"condition that ties the tables together, or remove {pronoun} from the query."
+            )
+        else:
+            names = [tables[component[0]] for component in components]
+            message = (
+                f"The tables {', '.join(names)} are read in groups with no predicate between the groups, so every "
+                f"row of one group pairs with every row of the others (cartesian product): counts come back "
+                f"multiplied and sums inflated. Add a condition that ties the groups together."
+            )
+        details: list[str] = []
+        for join in joins:
+            on, key = join.args.get("on"), _table_key(join.this)
+            if on is None or key not in tables or tables[key] not in lonely:
+                continue
+            referenced = {
+                phys.table_key
+                for column in on.find_all(exp.Column)
+                if column.find_ancestor(exp.Select) is select
+                and (phys := _trace(scope, column))
+                and phys.table_key in tables
+            }
+            if len(referenced) == 1 and key not in referenced:
+                details.append(f"The ON clause {on.sql()} compares only columns of {tables[next(iter(referenced))]}.")
+        if details:
+            message += " " + " ".join(details[:2])
+        out.append(message)
     return out
 
 
