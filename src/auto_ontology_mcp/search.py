@@ -26,13 +26,21 @@ class Doc:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
-def _field_score(q_tokens: list[str], q_norm: str, text: str) -> float:
+def _field_score(
+    q_tokens: list[str], q_norm: str, text: str, dropped: list[str] | None = None
+) -> float:
     if not text:
         return 0.0
     f_tokens = tokens(text)
     if not f_tokens:
         return 0.0
     f_set = set(f_tokens)
+    # A question word the field itself carries is part of the name the caller asked
+    # for ("Order No", "Has Children"), so it counts like any other query token.
+    # One the field does not carry costs a little instead of being free.
+    present = [d for d in (dropped or []) if d in f_set]
+    q_tokens = [*q_tokens, *present]
+    unmatched = len(dropped or []) - len(present)
     total = 0.0
     for q in q_tokens:
         if q in f_set:
@@ -52,20 +60,26 @@ def _field_score(q_tokens: list[str], q_norm: str, text: str) -> float:
     if len(q_norm) >= 3 and q_norm in norm_text:
         coverage = max(coverage, 1.0)
     # Prefer tight matches: "Order" beats "Order Line" for the query "order".
-    extra = max(0, len(f_set) - len(set(q_tokens)))
+    extra = max(0, len(f_set) - len(set(q_tokens))) + unmatched
     return coverage * (1.0 / (1.0 + 0.04 * extra))
 
 
 def score(query: str, doc: Doc) -> float:
-    # A question's auxiliaries are dropped from the query only: the field text is
-    # tokenized as written, so a column literally named "Make" still scores.
-    q_tokens = [t for t in tokens(query) if t not in QUESTION_WORDS]
+    # A question's auxiliaries do not decide the match, but the field may carry
+    # them as part of its name ("Order No"), so they are handed to the field
+    # scorer rather than dropped outright. The field text itself is tokenized as
+    # written, which is why a column named "Make" keeps scoring.
+    raw = tokens(query)
+    if not raw:
+        raw = tokens(query, drop_stopwords=False)
+    q_tokens = [t for t in raw if t not in QUESTION_WORDS]
+    dropped = [t for t in raw if t in QUESTION_WORDS]
     if not q_tokens:
-        q_tokens = tokens(query, drop_stopwords=False)
+        q_tokens, dropped = raw, []
     if not q_tokens:
         return 0.0
     q_norm = normalize_text(query).strip()
-    scored = sorted((_field_score(q_tokens, q_norm, text) * w for text, w in doc.fields), reverse=True)
+    scored = sorted((_field_score(q_tokens, q_norm, text, dropped) * w for text, w in doc.fields), reverse=True)
     if not scored:
         return 0.0
     best = scored[0] + (0.15 * scored[1] if len(scored) > 1 else 0.0)

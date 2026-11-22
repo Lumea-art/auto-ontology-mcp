@@ -531,13 +531,17 @@ def test_question_grammar_is_not_an_entity(modeled):
     assert have["verdict"] == "answerable"
 
 
-def test_a_question_word_does_not_dilute_a_search_score(modeled):
-    """The content words score the same whether or not the question's grammar is there."""
+def test_a_question_word_barely_dilutes_a_search_score(modeled):
+    """An unmatched auxiliary costs a little, not the third it cost before.
+
+    It cannot be free: the field may carry it as part of its name, and then it has
+    to count. So the question stays just under its own content words.
+    """
     question = {h["name"]: h["score"] for h in modeled.search_ontology("Which region has the most employees?")["hits"]}
     words = {h["name"]: h["score"] for h in modeled.search_ontology("region employee")["hits"]}
 
-    assert question["Region"] == pytest.approx(words["Region"])
-    assert question["Employee"] == pytest.approx(words["Employee"])
+    assert question["Region"] < words["Region"]
+    assert question["Region"] > 0.95 * words["Region"]
     assert question["Region"] > 0.5
 
 
@@ -552,10 +556,25 @@ def test_a_field_named_like_a_question_word_is_still_searchable():
 
     make = Doc("attribute", "a1", "Vehicle > Make", [("Make", 1.0)])
     place = Doc("attribute", "a2", "Event > Place", [("Place", 1.0)])
+    order_no = Doc("attribute", "a3", "Order No", [("Order No", 1.0)])
+    order = Doc("attribute", "a4", "Order", [("Order", 1.0)])
+    has_children = Doc("attribute", "a5", "Has Children", [("Has Children", 1.0)])
+    children = Doc("attribute", "a6", "Children", [("Children", 1.0)])
 
     assert score("make", make) == pytest.approx(1.0)
     assert score("vehicle make", make) == pytest.approx(0.5)
     assert score("place", place) == pytest.approx(1.0)
+
+    # A question word the field carries is part of the name being asked for, so
+    # "order no" must rank "Order No" above "Order" rather than rewarding the
+    # shorter field for dropping it.
+    assert score("order no", order_no) == pytest.approx(1.0)
+    assert score("order no", order) == pytest.approx(0.9615)
+    assert score("order no", order_no) > score("order no", order)
+    assert score("has children", has_children) == pytest.approx(1.0)
+    assert score("has children", children) == pytest.approx(0.9615)
+    assert score("has children", has_children) > score("has children", children)
+
     assert tokens("Make") == ["make"]
     assert "make" not in STOPWORDS and "make" not in QUESTION_WORDS
     assert "place" not in QUESTION_WORDS
