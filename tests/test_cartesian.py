@@ -135,3 +135,41 @@ def test_validate_sql_stays_quiet_when_a_predicate_links_the_tables(modeled):
         "SELECT COUNT(*) FROM orders, customers WHERE orders.customer_id = customers.customer_id"
     )
     assert not any("cartesian product" in w for w in check["warnings"])
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # a bridge through a derived table or a CTE links the physical tables it joins
+        """SELECT COUNT(*) FROM orders o
+           JOIN (SELECT customer_id FROM customers GROUP BY customer_id) t ON t.customer_id = o.customer_id
+           JOIN customers c ON c.customer_id = t.customer_id""",
+        """WITH t AS (SELECT customer_id FROM customers)
+           SELECT COUNT(*) FROM orders o, t, customers c
+           WHERE o.customer_id = t.customer_id AND t.customer_id = c.customer_id""",
+        # any operator or function between two sources counts, not a list of comparison types
+        "SELECT * FROM orders o JOIN customers c ON o.customer_id IS NOT DISTINCT FROM c.customer_id",
+        "SELECT * FROM orders o JOIN customers c ON o.status LIKE c.customer_name || '%'",
+        "SELECT * FROM orders o JOIN customers c ON o.status GLOB c.customer_name",
+        "SELECT * FROM orders o JOIN customers c ON instr(o.status, c.customer_name) > 0",
+        # a mixed side: columns of two tables on one side of the comparison
+        """SELECT * FROM orders o
+           JOIN order_lines l ON l.order_id = o.order_id
+           JOIN customers c ON o.order_id + l.order_line_id = c.customer_id""",
+    ],
+)
+def test_a_link_through_a_bridge_or_an_expression_is_not_reported(sql):
+    assert warnings_for(sql) == []
+
+
+def test_a_derived_table_on_its_own_is_not_reported():
+    assert warnings_for("SELECT COUNT(*) FROM orders o, (SELECT COUNT(*) AS n FROM customers) t") == []
+
+
+def test_a_pair_tied_only_inside_exists_is_still_reported():
+    sql = (
+        "SELECT COUNT(*) FROM orders o, customers c "
+        "WHERE EXISTS (SELECT 1 FROM cities WHERE cities.city_id = o.customer_id AND cities.city_id = c.customer_id)"
+    )
+    warnings = warnings_for(sql)
+    assert len(warnings) == 1
+    assert "cartesian product" in warnings[0]

@@ -272,18 +272,18 @@ class _Groups:
         return list(out.values())
 
 
+def _is_table(source: Any) -> bool:
+    """A physical table: not a CTE or derived table, and not a table-valued function."""
+    return isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier)
+
+
 def _source_tables(scope: Scope) -> dict[str, exp.Table]:
     """The physical tables the scope reads, keyed by the name the query gives them.
 
     Two aliases of one table are two entries: ``orders o1 JOIN orders o2`` reads the table twice
-    and pairs both halves. CTEs, derived tables and table-valued functions are left out; the last
-    ones parse as a table whose name is a call, not an identifier.
+    and pairs both halves.
     """
-    sources: dict[str, exp.Table] = {}
-    for name, source in scope.sources.items():
-        if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
-            sources[name] = source
-    return sources
+    return {name: source for name, source in scope.sources.items() if _is_table(source)}
 
 
 def _source_label(name: str, table: exp.Table) -> str:
@@ -292,7 +292,7 @@ def _source_label(name: str, table: exp.Table) -> str:
     return qualified if name.casefold() == table.name.casefold() else f"{qualified} AS {name}"
 
 
-def _alias_of(column: exp.Column, sources: dict[str, exp.Table], lookup: Lookup | None) -> str | None:
+def _alias_of(column: exp.Column, sources: dict[str, Any], lookup: Lookup | None) -> str | None:
     """The source a column comes from, when this scope can tell without guessing."""
     if column.table:
         folded = column.table.casefold()
@@ -301,21 +301,16 @@ def _alias_of(column: exp.Column, sources: dict[str, exp.Table], lookup: Lookup 
         return next(iter(sources))
     if lookup is None:
         return None
-    owners = [name for name, table in sources.items() if lookup(PhysicalColumn(table.db or "", table.name, column.name))]
+    owners = [
+        name
+        for name, source in sources.items()
+        if _is_table(source) and lookup(PhysicalColumn(source.db or "", source.name, column.name))
+    ]
     return owners[0] if len(owners) == 1 else None
 
 
-def _side_owner(
-    node: exp.Expression | None,
-    select: exp.Select,
-    sources: dict[str, exp.Table],
-    lookup: Lookup | None,
-) -> str | None:
-    """The one source every column in *node* comes from; None when it has none or mixes sources.
-
-    The side is allowed to be an expression: ``DATE(o.order_date)`` and ``o.id + 0`` both belong
-    to ``o``, which is how a join on a date or a transformed key is recognized.
-    """
+def _side_owner(node: exp.Expression | None, select: exp.Select, sources: dict[str, Any], lookup: Lookup | None) -> str | None:
+    """The one source every column in *node* comes from; None when it has none or mixes sources."""
     if node is None:
         return None
     columns = [node] if isinstance(node, exp.Column) else node.find_all(exp.Column)
@@ -328,6 +323,17 @@ def _side_owner(
             return None
         owners.add(owner)
     return owners.pop() if len(owners) == 1 else None
+
+
+def _conjuncts(node: exp.Expression):
+    """The AND-separated parts of a predicate: each one states how some rows relate."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.And):
+        yield from _conjuncts(node.left)
+        yield from _conjuncts(node.right)
+    else:
+        yield node
 
 
 def cartesian_products(tree: exp.Expression, lookup: Lookup | None = None, hint: Callable[[str, str], str | None] | None = None) -> list[str]:
@@ -343,62 +349,75 @@ def cartesian_products(tree: exp.Expression, lookup: Lookup | None = None, hint:
         select = scope.expression
         if not isinstance(select, exp.Select):
             continue
-        sources = _source_tables(scope)
+        # Every source of the scope: physical tables, CTEs and derived tables. A CTE or a derived
+        # table carries a link between the tables it is joined to, so they all take part.
+        sources: dict[str, Any] = dict(scope.sources)
+        physical = _source_tables(scope)
         if len(sources) < 2:
             continue
         groups = _Groups(list(sources))
 
-        def linked(first: exp.Expression | None, second: exp.Expression | None) -> None:
-            one = _side_owner(first, select, sources, lookup)
-            two = _side_owner(second, select, sources, lookup)
-            if one is not None and two is not None and one != two:
-                groups.union(one, two)
+        def union_all(names: list[str]) -> None:
+            unique = list(dict.fromkeys(names))
+            for other in unique[1:]:
+                groups.union(unique[0], other)
 
-        # Any comparison links two sources: a range join (=, <, BETWEEN) ties the rows as much as an
-        # equality, and WHERE counts as much as ON ("FROM a, b WHERE a.id = b.a_id" is a join).
-        for comparison in select.find_all((exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE)):
-            if comparison.find_ancestor(exp.Select) is select:
-                linked(comparison.left, comparison.right)
-        for between in select.find_all(exp.Between):
-            if between.find_ancestor(exp.Select) is not select:
-                continue
-            for bound in (between.args.get("low"), between.args.get("high")):
-                linked(between.this, bound)
-        for member in select.find_all(exp.In):
-            if member.find_ancestor(exp.Select) is not select or member.args.get("query") is not None:
-                continue
-            for item in member.expressions:
-                linked(member.this, item)
-        joins = [join for join in select.args.get("joins") or [] if isinstance(join.this, exp.Table)]
+        def sources_in(node: exp.Expression) -> list[str]:
+            names: list[str] = []
+            for column in node.find_all(exp.Column):
+                if column.find_ancestor(exp.Select) is not select:
+                    continue  # a subquery of this scope has its own sources
+                name = _alias_of(column, sources, lookup)
+                if name is not None:
+                    names.append(name)
+            return names
+
+        predicates: list[exp.Expression] = []
+        where = select.args.get("where")
+        if where is not None:
+            predicates.extend(_conjuncts(where.this))
+        joins = list(select.args.get("joins") or [])
+        for join in joins:
+            on = join.args.get("on")
+            if on is not None:
+                predicates.extend(_conjuncts(on))
+        # Any operator or function counts. A conjunct that names two sources ties them, whether it
+        # is `=`, `LIKE`, `IS NOT DISTINCT FROM`, a comparison of a function's result, or an
+        # arithmetic expression with one table's columns on one side.
+        for predicate in predicates:
+            names = sources_in(predicate)
+            if len(set(names)) >= 2:
+                union_all(names)
         for join in joins:
             key = next((name for name in sources if name.casefold() == join.this.alias_or_name.casefold()), None)
-            if key is None:
+            if key is None or not isinstance(join.this, exp.Table):
                 continue
             # USING and NATURAL tie the joined table to the tables on its left. The columns of an
             # ON predicate were traced above. Either way the table is not left on its own.
             if join.args.get("using") or str(join.args.get("method") or "").upper() == "NATURAL":
-                for other in sources:
-                    if other != key:
-                        groups.union(key, other)
-        components = groups.groups()
-        if len(components) == 1:
+                union_all([key, *[name for name in sources if name != key]])
+        # Only physical tables are reported: a CTE or a derived table answers for itself in its own
+        # scope, and a bridge through one shows up here as the tables it connects.
+        components = [[name for name in component if name in physical] for component in groups.groups()]
+        components = [component for component in components if component]
+        if len(components) <= 1:
             continue
-        labels = {name: _source_label(name, table) for name, table in sources.items()}
+        labels = {name: _source_label(name, table) for name, table in physical.items()}
 
         def example(name: str) -> str | None:
             """A known join from *name* to another source, if the caller knows one."""
             if hint is None:
                 return None
-            for other, table in sources.items():
+            for other, table in physical.items():
                 if other == name:
                     continue
-                found = hint(sources[name].name, table.name)
+                found = hint(physical[name].name, table.name)
                 if found:
                     return found
             return None
 
         lonely = [name for component in components if len(component) == 1 for name in component]
-        if lonely and len(lonely) == len(sources):
+        if lonely and len(lonely) == len(physical):
             message = (
                 f"Tables {', '.join(labels[name] for name in lonely)} are read in the same FROM/JOIN list with no "
                 f"predicate linking them, so every row of one pairs with every row of the other (cartesian product): "
@@ -426,7 +445,7 @@ def cartesian_products(tree: exp.Expression, lookup: Lookup | None = None, hint:
         for join in joins:
             on = join.args.get("on")
             key = next((name for name in sources if name.casefold() == join.this.alias_or_name.casefold()), None)
-            if on is None or key is None or key not in lonely:
+            if on is None or key not in lonely:
                 continue
             owner = _side_owner(on, select, sources, lookup)
             if owner is not None and owner != key:
