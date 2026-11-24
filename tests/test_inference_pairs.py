@@ -170,3 +170,59 @@ def test_a_full_catalog_is_not_scored_pair_by_pair(monkeypatch):
 
     pairs = sum(len(cols) for cols in columns.values()) * len(tables)
     assert calls < pairs * 0.15, f"{calls} scores for {pairs} pairs"
+
+def test_a_strong_indexed_match_skips_the_fuzzy_scan(monkeypatch):
+    """A fuzzy candidate scores 0.6 and stays within 0.1 of the best, so above 0.7 it cannot survive."""
+    tables, columns = _schema(
+        [
+            ("customers", "id", [("id", "INTEGER")]),
+            ("orders", "order_id", [("order_id", "INTEGER"), ("customer_id", "INTEGER")]),
+            ("custmer", "id", [("id", "INTEGER")]),
+        ]
+    )
+    seen: list[str] = []
+    original = inference._similar
+
+    def counting(base, table_name):
+        seen.append(base)
+        return original(base, table_name)
+
+    monkeypatch.setattr(inference, "_similar", counting)
+    candidates, _ = inference.candidate_pairs(tables, columns, set())
+    # An empty stem ("id") is compared with the bare-"id" targets it was indexed for, and the
+    # ratio is zero; the point here is that the strong column's stem never reaches the fuzzy rule.
+    assert "customer" not in seen
+    assert [(c.name_score, c.target["table"]["id"]) for c in candidates if c.source["name"] == "customer_id"] == [
+        (0.9, "tbl_customers")
+    ]
+
+    # With the skip removed the same schema does reach the fuzzy comparison, so the miss above is
+    # the skip and not a schema that could never fuzzy-match.
+    monkeypatch.setattr(inference, "_FUZZY_FLOOR", 1.0)  # every indexed score is at or below it
+    inference.candidate_pairs(tables, columns, set())
+    assert "customer" in seen
+
+
+def test_the_fuzzy_window_still_runs_when_nothing_else_matched():
+    tables, columns = _schema(
+        [
+            ("customers", "id", [("id", "INTEGER")]),
+            ("orders", "order_id", [("order_id", "INTEGER"), ("custmer_id", "INTEGER")]),
+        ]
+    )
+    candidates, _ = inference.candidate_pairs(tables, columns, set())
+    typo = [c for c in candidates if c.source["name"] == "custmer_id"]
+    assert [(c.name_score, c.target["table"]["id"]) for c in typo] == [(0.6, "tbl_customers")]
+
+
+def test_a_seventy_score_still_keeps_a_fuzzy_candidate():
+    """0.7 - 0.1 is exactly 0.6: a fuzzy candidate is kept, so the window must still be opened."""
+    tables, columns = _schema(
+        [
+            ("orders", "order_id", [("order_id", "INTEGER"), ("parent_id", "INTEGER")]),
+            ("parrent", "id", [("id", "INTEGER")]),
+        ]
+    )
+    candidates, _ = inference.candidate_pairs(tables, columns, set())
+    parent = sorted(((c.name_score, c.target["table"]["id"]) for c in candidates if c.source["name"] == "parent_id"), reverse=True)
+    assert parent == [(0.7, "tbl_orders"), (0.6, "tbl_parrent")]

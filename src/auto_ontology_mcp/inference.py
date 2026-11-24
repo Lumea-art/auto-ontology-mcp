@@ -101,6 +101,9 @@ def _looks_like_measure(column: str) -> bool:
 # cannot reference a table by matching "id", so these fall through to the table-name rules.
 _BARE_NAMES = ("id", "uuid", "guid", "key")
 _FUZZY_CUTOFF = 0.85
+# The fuzzy rule scores 0.6, and a column keeps only candidates within 0.1 of its best score.
+# Once an indexed rule scores above this, no fuzzy candidate can be kept, so the scan is skipped.
+_FUZZY_FLOOR = 0.7
 
 
 @dataclass(frozen=True)
@@ -233,12 +236,20 @@ class _TargetIndex:
             add(self._by_base.get(suffix, []))
         for i in range(len(source.name) - 3):
             add(self._by_name.get(source.name[i:], []))
-        # The fuzzy rule wants a ratio of 0.85 between the source stem and the target's table
-        # name, which caps how far apart their lengths can be: only that window is looked at.
+        return list(found.values())
+
+    def fuzzy_candidates(self, source: _Prepared) -> list[_Prepared]:
+        """The bare-id targets the fuzzy rule could reach.
+
+        It wants a ratio of 0.85 between the source's entity stem and the target's table name,
+        which caps how far apart their lengths can be: only that window is worth scoring.
+        """
+        base = source.base
+        if base is None:
+            return []
         low = (85 * len(base) + 114) // 115
         high = (115 * len(base)) // 85
-        add(self._fuzzy[bisect_left(self._fuzzy_lengths, low) : bisect_right(self._fuzzy_lengths, high)])
-        return list(found.values())
+        return self._fuzzy[bisect_left(self._fuzzy_lengths, low) : bisect_right(self._fuzzy_lengths, high)]
 
 
 def candidate_pairs(
@@ -273,20 +284,27 @@ def candidate_pairs(
             id_like = source.base is not None
             if _looks_like_measure(col["name"]) and not id_like:
                 continue
-            found: list[tuple[float, str | None, str, _Prepared]] = []
-            for target in index.candidates(source):
-                if target.column["id"] == col["id"]:
-                    continue
-                if is_own_pk and target.table["id"] == table["id"]:
-                    continue
-                if not _families_compatible(source.family, target.family):
-                    continue
-                hit = _score_prepared(source, target)
-                if hit is None:
-                    continue
-                score, role, reason = hit
-                # A table's own single PK only references another table in 1:1 extension tables.
-                found.append((score - 0.2 if is_own_pk else score, role, reason, target))
+            def score_all(candidates: Any) -> list[tuple[float, str | None, str, _Prepared]]:
+                out: list[tuple[float, str | None, str, _Prepared]] = []
+                for target in candidates:
+                    if target.column["id"] == col["id"]:
+                        continue
+                    if is_own_pk and target.table["id"] == table["id"]:
+                        continue
+                    if not _families_compatible(source.family, target.family):
+                        continue
+                    hit = _score_prepared(source, target)
+                    if hit is None:
+                        continue
+                    score, role, reason = hit
+                    # A table's own single PK only references another table in 1:1 extension tables.
+                    out.append((score - 0.2 if is_own_pk else score, role, reason, target))
+                return out
+
+            found = score_all(index.candidates(source))
+            if not found or max(item[0] for item in found) <= _FUZZY_FLOOR:
+                matched = {item[3].column["id"] for item in found}
+                found += score_all(target for target in index.fuzzy_candidates(source) if target.column["id"] not in matched)
             if found:
                 # The old loop appended candidates in target order and sorted by score (stable), so
                 # an equal score keeps the earlier target. Sorting by (-score, position) reproduces
