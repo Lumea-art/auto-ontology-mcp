@@ -173,3 +173,9 @@ def test_a_pair_tied_only_inside_exists_is_still_reported():
     warnings = warnings_for(sql)
     assert len(warnings) == 1
     assert "cartesian product" in warnings[0]
+
+
+def test_a_mysql_null_safe_join_is_a_link():
+    """`<=>` parses as IS NOT DISTINCT FROM, and the conjunct rule does not care which it is."""
+    sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id <=> c.customer_id"
+    assert cartesian_products(guard_readonly(sql, "mysql")) == []
