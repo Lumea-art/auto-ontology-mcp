@@ -449,7 +449,8 @@ def cartesian_products(tree: exp.Expression, lookup: Lookup | None = None, hint:
                 continue
             owner = _side_owner(on, select, sources, lookup)
             if owner is not None and owner != key:
-                details.append(f"The ON clause {on.sql()} compares only columns of {labels[owner]}.")
+                # owner can be a CTE or a derived table, which has a name but no table label.
+                details.append(f"The ON clause {on.sql()} compares only columns of {labels.get(owner, owner)}.")
         if lonely:
             suggestion = example(lonely[0])
             if suggestion:

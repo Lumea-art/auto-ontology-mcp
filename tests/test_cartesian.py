@@ -179,3 +179,21 @@ def test_a_mysql_null_safe_join_is_a_link():
     """`<=>` parses as IS NOT DISTINCT FROM, and the conjunct rule does not care which it is."""
     sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id <=> c.customer_id"
     assert cartesian_products(guard_readonly(sql, "mysql")) == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        """SELECT COUNT(*) FROM orders o
+           JOIN (SELECT customer_id FROM customers) t ON t.customer_id = o.customer_id
+           JOIN products p ON t.customer_id > 0""",
+        """WITH t AS (SELECT customer_id FROM customers)
+           SELECT COUNT(*) FROM orders o JOIN t ON t.customer_id = o.customer_id
+           JOIN products p ON t.customer_id > 0""",
+    ],
+)
+def test_a_lonely_table_whose_on_binds_a_cte_or_derived_table_is_named(sql):
+    """The owner of that ON has a name but no table label, and the message must still be built."""
+    warnings = warnings_for(sql)
+    assert len(warnings) == 1
+    assert "compares only columns of t" in warnings[0]
